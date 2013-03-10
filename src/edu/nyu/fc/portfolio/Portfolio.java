@@ -64,9 +64,10 @@ public class Portfolio implements IPortfolio<IPosition> {
                 position = new Position(position.getQuantity() + quantity,
                         symbol);
             }
+            // update portfolio
             portfolio.put(symbol, position);
         } catch (final PositionQuantityException pqe) {
-            // remove position resulting in zero quantity after the new trade
+            // remove position if the new trade resulted in zero quantity
             if (portfolio.containsKey(symbol)) {
                 portfolio.remove(symbol);
             }
