@@ -5,7 +5,6 @@ import java.util.Iterator;
 import java.util.Map;
 
 import edu.nyu.fc.position.IPosition;
-import edu.nyu.fc.position.Position;
 import edu.nyu.fc.position.PositionQuantityException;
 
 /**
@@ -19,6 +18,9 @@ import edu.nyu.fc.position.PositionQuantityException;
  * a zero quantity position for MSFT, which is invalid and such position is
  * removed from portfolio all together.
  * 
+ * This implementation is not thread-safe and extra care needs to be taken when
+ * used in multi-threaded applications.
+ * 
  * @author Yourii Martiak
  * 
  */
@@ -27,7 +29,7 @@ public class Portfolio implements IPortfolio<IPosition> {
     /**
      * Internal store for collection of portfolio positions
      */
-    private final Map<String, IPosition> portfolio;
+    private final Map<String, PositionImpl> portfolio;
 
     /**
      * Default constructor, creates empty portfolio with initial capacity for
@@ -47,25 +49,29 @@ public class Portfolio implements IPortfolio<IPosition> {
      *            internal resource allocation for initial portfolio capacity
      */
     public Portfolio(final int size) {
-        portfolio = new HashMap<String, IPosition>(size);
+        portfolio = new HashMap<String, PositionImpl>(size);
     }
 
     @Override
     public void newTrade(final String symbol, final int quantity) {
         try {
-            IPosition position = portfolio.get(symbol);
+            PositionImpl position = portfolio.get(symbol);
             if (position == null) {
                 // create completely new position if portfolio did not contain
                 // prior position for the symbol
-                position = new Position(quantity, symbol);
+                position = new PositionImpl(quantity, symbol);
+                portfolio.put(symbol, position);
             } else {
-                // create new position with an updated quantity if portfolio
+                // update position quantity if portfolio
                 // contained prior position for the symbol
-                position = new Position(position.getQuantity() + quantity,
-                        symbol);
+                position.quantity += quantity;
+                // throw exception if resulting quantity becomes zero, this
+                // will remove position from portfolio
+                if (position.quantity == 0) {
+                    throw new PositionQuantityException(
+                            "Invalid position quantity 0");
+                }
             }
-            // update portfolio
-            portfolio.put(symbol, position);
         } catch (final PositionQuantityException pqe) {
             // remove position if the new trade resulted in zero quantity
             if (portfolio.containsKey(symbol)) {
@@ -91,7 +97,7 @@ public class Portfolio implements IPortfolio<IPosition> {
         /**
          * Get internal store's iterator to be used by adapter
          */
-        Iterator<IPosition> iterator = portfolio.values().iterator();
+        Iterator<PositionImpl> iterator = portfolio.values().iterator();
 
         /**
          * Get next iterator position or null if already at the last position or
@@ -100,6 +106,44 @@ public class Portfolio implements IPortfolio<IPosition> {
         @Override
         public IPosition getNextPosition() {
             return iterator.hasNext() ? iterator.next() : null;
+        }
+
+    }
+
+    /**
+     * Internal portfolio position implementation that allow positions to be
+     * mutable and quantity of an existing position can be updated after a new
+     * trade to avoid creating a new position for every position update.
+     *
+     */
+    private class PositionImpl implements IPosition {
+
+        private int quantity;
+        private final String symbol;
+
+        PositionImpl(final int quantity, final String symbol) {
+            // we do not allow positions with zero quantity because that
+            // indicates that no position exists
+            if (quantity == 0) {
+                throw new PositionQuantityException(
+                        "Invalid position quantity 0");
+            }
+            // position with null security symbol is invalid
+            if (symbol == null) {
+                throw new IllegalArgumentException("Invalid symbol null");
+            }
+            this.quantity = quantity;
+            this.symbol = symbol;
+        }
+
+        @Override
+        public String getSymbol() {
+            return symbol;
+        }
+
+        @Override
+        public int getQuantity() {
+            return quantity;
         }
 
     }
