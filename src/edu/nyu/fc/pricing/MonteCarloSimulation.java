@@ -1,6 +1,13 @@
 package edu.nyu.fc.pricing;
 
-import org.omg.CORBA.portable.ApplicationException;
+import javax.jms.JMSException;
+import javax.naming.NamingException;
+
+import edu.nyu.fc.messaging.AMQMessageProcessor;
+import edu.nyu.fc.messaging.IMessageProcessor;
+import edu.nyu.fc.messaging.MessagingException;
+import edu.nyu.fc.messaging.PayoutRequest;
+import edu.nyu.fc.messaging.PayoutResponse;
 
 /**
  * This class is used as a simulation manager to run MonteCarloSimulation for
@@ -15,7 +22,7 @@ public class MonteCarloSimulation {
 
     /**
      * Interval of number of simulations at which to evaluate margin of error to
-     * decide when to stop our simulations
+     * decide when to stop our simulationsreq=REQ.OPT rsp=RSP.OPT
      */
     private static final int SNAPSHOT_RATE = 100;
 
@@ -31,6 +38,16 @@ public class MonteCarloSimulation {
     // optional parameters for which we use defaults
     private final OptionType optionType;
     private final Distribution distribution;
+    private final String requestQueueName;
+    private final String responseQueueName;
+    private final String selectorID;
+
+    // message processor
+    private final IMessageProcessor messageProcessor;
+
+    // flag to indicate if the simulation is running in distributed or local
+    // mode
+    private boolean isDistributed;
 
     /**
      * Creates new instance of monte carlo simulation as per input parameters
@@ -53,11 +70,16 @@ public class MonteCarloSimulation {
      *            type of option
      * @param distribution
      *            type of random number distribution
+     * @throws MessagingException
+     * @throws JMSException
+     * @throws NamingException
      */
     public MonteCarloSimulation(final int daysToExpire, final double price,
             final double rate, final double sigma, final double strikePrice,
             final double probability, final double estimationError,
-            final OptionType optionType, final Distribution distribution) {
+            final OptionType optionType, final Distribution distribution,
+            final String requestQueueName, final String responseQueueName)
+            throws NamingException, JMSException, MessagingException {
         this.daysToExpire = daysToExpire;
         this.price = price;
         this.rate = rate;
@@ -67,6 +89,19 @@ public class MonteCarloSimulation {
         this.estimationError = estimationError;
         this.optionType = optionType;
         this.distribution = distribution;
+        this.requestQueueName = requestQueueName;
+        this.responseQueueName = responseQueueName;
+        this.selectorID = optionType.toString() + "_"
+                + distribution.toString() + "." + System.nanoTime();
+
+        if (requestQueueName != null && responseQueueName != null) {
+            this.isDistributed = true;
+            this.messageProcessor = new AMQMessageProcessor(requestQueueName,
+                    responseQueueName, selectorID);
+        } else {
+            this.isDistributed = false;
+            this.messageProcessor = null;
+        }
     }
 
     /**
@@ -91,22 +126,35 @@ public class MonteCarloSimulation {
      *        SND      standard normal disribution (default)
      *        GND      gaussian normal distribution
      *        ATD      antithetic normal distribution
+     * In order to run simulation in distributed mode must provide the following:
+     *   req  request queue name
+     *   rsp  response queue name
      *        
-     * Example 1: MonteCarloSimulation d=252 p=152.35 r=0.0001 s=0.01 sp=165 pr=2.05 e=0.01
+     * Example 1: MonteCarloSimulation d=252 p=152.35 r=0.0001 s=0.01 sp=165 pr=2.05 e=0.01 req=REQ.OPT rsp=RSP.OPT
      * creates new monte carlo simulation of American call option payout that expires
      * in 252 days with asset price $152.35, rate of 0.1%, daily volatility of
      * 1%, strike price of $165.00, probability of 96% having estimation error
      * under 1% and using standard normal distribution with zero mean and 1.0
      * deviation
      * 
-     * Example 2: MonteCarloSimulation d=252 p=152.35 r=0.0001 s=0.01 sp=164 pr=2.05 e=0.01 t=AS_CALL ds=ATD
+     * Example 2: MonteCarloSimulation d=252 p=152.35 r=0.0001 s=0.01 sp=164 pr=2.05 e=0.01 t=AS_CALL ds=ATD req=REQ.OPT rsp=RSP.OPT
      * creates new monte carlo simulation of Asian call option payout that expires
      * in 252 days with asset price $152.35, rate of 0.1%, daily volatility of
      * 1%, strike price of $164.00, probability of 96% having estimation error
      * under 1% and using antithetic gaussian normal distribution
      * </pre>
+     * 
+     * @throws MessagingException
      */
-    public void run() {
+    public void run() throws MessagingException {
+        if (isDistributed) {
+            runDistributed();
+        } else {
+            runLocal();
+        }
+    }
+
+    public void runLocal() {
         double error = 1.0;
         double payoutValue = 0.0;
         double payoutSum = 0.0;
@@ -148,6 +196,76 @@ public class MonteCarloSimulation {
         System.out.println(String.format("Run through %d simulations", i));
         System.out.println(String.format(
                 "Snapshot taken at every %d simulation", SNAPSHOT_RATE));
+        System.out.println(String.format(
+                "Estimated payout value=%f with error=%f", payoutValue, error));
+    }
+
+    public void runDistributed() throws MessagingException {
+        // start message processor
+        messageProcessor.start();
+
+        double error = 1.0;
+        double payoutValue = 0.0;
+        double payoutSum = 0.0;
+        int i = SNAPSHOT_RATE;
+
+        // take start timestamp
+        final long start = System.currentTimeMillis();
+
+        // run simulation until our error falls under the threshold
+        while (error > estimationError) {
+            // send a batch of requests
+            for (int j = 0; j < SNAPSHOT_RATE; j++) {
+                try {
+                    messageProcessor.sendMessage(new PayoutRequest(
+                            daysToExpire, price, rate, sigma, strikePrice,
+                            optionType, distribution, selectorID));
+                } catch (MessagingException e) {
+                    e.printStackTrace();
+                }
+            }
+            // now receive all responses back
+            for (int j = 0; j < SNAPSHOT_RATE; j++) {
+                PayoutResponse payoutResponse = null;
+                try {
+                    payoutResponse = (PayoutResponse) messageProcessor
+                            .receiveMessage();
+                } catch (MessagingException e) {
+                    e.printStackTrace();
+                }
+                if (payoutResponse != null) {
+                    payoutSum += payoutResponse.getPayout();
+                }
+            }
+
+            // get the average payout value
+            payoutValue = payoutSum / i;
+            // discount payout values in today's terms
+            payoutValue *= Math.exp(-rate * daysToExpire);
+            // calculate margin of error
+            error = probability * payoutValue / Math.sqrt(i);
+            i += SNAPSHOT_RATE;
+
+        }
+
+        // stop message processor
+        messageProcessor.stop();
+        
+        // close the connection
+        messageProcessor.close();
+
+        // take stop timestamp
+        final long stop = System.currentTimeMillis();
+
+        // calculate run time
+        final long runTime = stop - start;
+
+        System.out.println("===");
+        System.out.println(String.format(
+                "MonteCarloSimulation for selectorID=%s finished in %d ms.", selectorID, runTime));
+        System.out.println(String.format("Run through %d simulations", i));
+        System.out.println(String.format(
+                "Requests were sent %d messages per batch", SNAPSHOT_RATE));
         System.out.println(String.format(
                 "Estimated payout value=%f with error=%f", payoutValue, error));
     }
@@ -209,7 +327,7 @@ public class MonteCarloSimulation {
      * @param optionType
      * @return payout for a given option type
      */
-    private static IPayout createPayout(final double strikePrice,
+    public static IPayout createPayout(final double strikePrice,
             final OptionType optionType) {
         if (OptionType.US_CALL == optionType) {
             return new AmericanCallOptionPayout(strikePrice);
@@ -227,7 +345,7 @@ public class MonteCarloSimulation {
      * @param distribution
      * @return random number generator for a given distribution type
      */
-    private static IRandomVectorGenerator createVectorGenerator(
+    public static IRandomVectorGenerator createVectorGenerator(
             final int daysToExpire, final Distribution distribution) {
         if (Distribution.SND == distribution) {
             return new RandomVectorGenerator(daysToExpire, 1.0);
@@ -266,6 +384,8 @@ public class MonteCarloSimulation {
         double strikePrice = 0;
         double probability = 0;
         double estimationError = 0;
+        String requestQueueName = null;
+        String responseQueueName = null;
         OptionType optionType = OptionType.US_CALL;
         Distribution distribution = Distribution.SND;
 
@@ -289,6 +409,10 @@ public class MonteCarloSimulation {
                 strikePrice = Double.parseDouble(nameValue.value);
             } else if (Parameter.t == nameValue.name) {
                 optionType = OptionType.valueOf(nameValue.value);
+            } else if (Parameter.req == nameValue.name) {
+                requestQueueName = nameValue.value;
+            } else if (Parameter.rsp == nameValue.name) {
+                responseQueueName = nameValue.value;
             }
         }
         if (daysToExpire == 0 || price == 0 || rate == 0 || sigma == 0
@@ -298,15 +422,24 @@ public class MonteCarloSimulation {
 
         return new MonteCarloSimulation(daysToExpire, price, rate, sigma,
                 strikePrice, probability, estimationError, optionType,
-                distribution);
+                distribution, requestQueueName, responseQueueName);
     }
 
     @Override
     public String toString() {
         return String
-                .format("MonteCarloSimulation {daysToExpire=%d, price=%f, rate=%f, sigma=%f, strikePrice=%f, probability=%f, estimationError=%f, optionType=%s, distribution=%s}",
-                        daysToExpire, price, rate, sigma, strikePrice,
-                        probability, estimationError, optionType, distribution);
+                .format("MonteCarloSimulation {daysToExpire=%d, price=%f, rate=%f, sigma=%f, strikePrice=%f, probability=%f, estimationError=%f, optionType=%s, distribution=%s, messageProcessor=%s}",
+                        daysToExpire,
+                        price,
+                        rate,
+                        sigma,
+                        strikePrice,
+                        probability,
+                        estimationError,
+                        optionType,
+                        distribution,
+                        messageProcessor == null ? null : messageProcessor
+                                .toString());
     }
 
     /**
@@ -356,7 +489,17 @@ public class MonteCarloSimulation {
         /**
          * Random number distribution type
          */
-        ds
+        ds,
+
+        /**
+         * Request queue name
+         */
+        req,
+
+        /**
+         * Response queue name
+         */
+        rsp
     };
 
     /**
